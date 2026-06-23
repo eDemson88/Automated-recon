@@ -2,20 +2,18 @@
 # 1️⃣ IMPORT & UTILS
 # ----------------------------------------------------------------------
 import argparse
-
+import re
 import openpyxl
+
 from pathlib import Path
 from typing import List, Dict, Any
 from openpyxl.utils import column_index_from_string
-
+from typing import Tuple
 # ----------------------------------------------------------------------
 # 2️⃣ LOAD & KONVERSI SHEET
 # ----------------------------------------------------------------------
 def load_sheet(path: Path, sheet_name: str = None) -> tuple[openpyxl.Workbook, openpyxl.worksheet.worksheet.Worksheet]:
-    """
-    Buka workbook dan kembalikan worksheet.
-    Jika sheet_name = None → gunakan sheet aktif.
-    """
+
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb.active
     return wb, ws
@@ -31,6 +29,56 @@ def sheet_to_records(ws) -> tuple[List[str], List[Dict[str, Any]]]:
     header = [str(cell).strip() for cell in rows[0]]
     records = [{header[i]: row[i] for i in range(len(header))} for row in rows[1:]]
     return header, records
+
+def _words_set(text: str) -> set:
+    if not text:
+        return set()
+    # hapus punctuation, ganti dengan spasi
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
+    return set(cleaned.split())
+
+def check_description_match(
+    records: List[Dict[str, Any]],
+    pairs: List[Tuple[int, int]],
+    descr_col: str = "Deskripsi",      # sesuaikan dengan nama kolom deskripsi Anda
+    status_col: str = "Catatan",      # kolom J yang nantinya di‑isi “recheck”
+    min_common_words: int = 1,        # default: minimal 1 kata yang sama
+    ratio: float | None = None,       # optional: persentase kemiripan (0‑1)
+) -> None:
+    """
+    Untuk setiap pasangan (credit, debit) yang sudah dibentuk:
+    - bandingkan set kata deskripsi masing‑masing.
+    - jika tidak memenuhi `min_common_words` **atau** tidak memenuhi `ratio`,
+      beri nilai `"recheck"` pada kolom `status_col` untuk **kedua** baris.
+    - fungsi meng‑modifikasi `records` secara in‑place.
+    """
+    # Pastikan kolom status ada dalam header (akan ditambahkan nanti
+    # bila belum ada, tetapi di sini kita hanya menyiapkan key)
+    for credit_idx, debit_idx in pairs:
+        desc_credit = records[credit_idx].get(descr_col, "")
+        desc_debit  = records[debit_idx].get(descr_col, "")
+
+        set_credit = _words_set(desc_credit)
+        set_debit  = _words_set(desc_debit)
+
+        common = set_credit.intersection(set_debit)
+
+        # Hitung apakah cukup cocok
+        ok = True
+        if ratio is not None:
+            # Persentase berdasarkan jumlah kata pada teks yang lebih pendek
+            smaller_len = min(len(set_credit), len(set_debit))
+            if smaller_len == 0:
+                ok = False
+            else:
+                ok = (len(common) / smaller_len) >= ratio
+        else:
+            ok = len(common) >= min_common_words
+
+        if not ok:
+            # Tandai kedua baris
+            records[credit_idx][status_col] = "recheck"
+            records[debit_idx][status_col] = "recheck"
 
 def build_lookup(records: List[Dict[str, Any]], key: str) -> Dict[Any, List[int]]:
     """
@@ -126,11 +174,18 @@ def reconcile_with_separate_unmatched(
     sheet_name: str = None,
     debit_col: str = "Debit",
     credit_col: str = "Credit",
+    descr_col: str = "Deskripsi",          # <‑‑ nama kolom deskripsi
+    status_col: str = "Catatan",           # <‑‑ kolom J (akan di‑isi "recheck")
+    min_common_words: int = 1,            # default ambang 1 kata
+    ratio: float | None = None,           # optional persentase (0‑1)
     dry_run: bool = False,
 ) -> None:
     # ---------- 1. Load ----------
     wb_src, ws_src = load_sheet(src_path, sheet_name)
     header, records = sheet_to_records(ws_src)
+
+    if status_col not in header:
+        header.append(status_col)
 
     # ---------- 2. Pairing ----------
     debit_lookup  = build_lookup(records, debit_col)
@@ -138,6 +193,7 @@ def reconcile_with_separate_unmatched(
 
     used = set()
     paired_rows: List[int] = []          # urutan indeks (0‑based) yang sudah dipasangkan
+    pairs: List[Tuple[int, int]] = []
     unmatched_debits: List[int] = []     # debit‑only
     unmatched_credits: List[int] = []    # credit‑only
 
@@ -154,6 +210,7 @@ def reconcile_with_separate_unmatched(
             if cand:
                 j = cand[0]
                 paired_rows.extend([j, i])      # credit dulu, debit di bawahnya
+                pairs.append((j, i))
                 used.update({j, i})
                 continue
 
@@ -163,6 +220,7 @@ def reconcile_with_separate_unmatched(
             if cand:
                 j = cand[0]
                 paired_rows.extend([i, j])      # credit dulu, debit di bawahnya
+                pairs.append((i, j))
                 used.update({i, j})
                 continue
 
@@ -172,6 +230,15 @@ def reconcile_with_separate_unmatched(
         else:
             unmatched_credits.append(i)
         used.add(i)
+
+    check_description_match(
+        records,
+        pairs,
+        descr_col=descr_col,
+        status_col=status_col,
+        min_common_words=min_common_words,
+        ratio=ratio,
+    )
 
     # ---------- 3. Urutan akhir ----------
     final_order = ["OPENING"] + paired_rows + ["BLANK"] + unmatched_debits + unmatched_credits
@@ -243,8 +310,17 @@ def build_cli() -> argparse.ArgumentParser:
                         help="Nama kolom Debit.")
     parser.add_argument("--credit-col", dest="credit_col", default="Credit",
                         help="Nama kolom Credit.")
+    parser.add_argument("--descr-col", dest="descr_col", default="Deskripsi",
+                        help="Nama kolom deskripsi yang akan dicek.")
     parser.add_argument("--balance-col", dest="balance_col", default="Balance",
                         help="Nama kolom Balance yang akan ditulis.")
+    parser.add_argument("--status-col", dest="status_col", default="Catatan",
+                        help="Nama kolom (J) yang akan di‑isi 'recheck' bila tidak cocok.")
+    parser.add_argument("--min-words", dest="min_common_words", type=int, default=1,
+                        help="Minimal jumlah kata yang harus sama (default 1).")
+    parser.add_argument("--ratio", dest="ratio", type=float, default=None,
+                        help="Jika diberikan, gunakan rasio (0‑1) sebagai ambang "
+                             "bobot kata yang sama, meng‑override --min-words.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Hanya tampilkan urutan indeks, tidak menulis file.")
     return parser
@@ -262,6 +338,10 @@ def main():
         sheet_name=args.sheet_name,
         debit_col=args.debit_col,
         credit_col=args.credit_col,
+        descr_col=args.descr_col,
+        status_col=args.status_col,
+        min_common_words=args.min_common_words,
+        ratio=args.ratio,
         dry_run=args.dry_run,
     )
 
