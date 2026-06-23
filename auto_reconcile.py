@@ -37,6 +37,12 @@ def _words_set(text: str) -> set:
     cleaned = re.sub(r"[^\w\s]", " ", text.lower())
     return set(cleaned.split())
 
+def _norm_descr(text: Any) -> str:
+    """Normalisasi deskripsi: lower‑case, strip, kosongkan bila None."""
+    if text is None:
+        return ""
+    return str(text).strip().lower()
+
 def check_description_match(
     records: List[Dict[str, Any]],
     pairs: List[Tuple[int, int]],
@@ -79,6 +85,54 @@ def check_description_match(
             # Tandai kedua baris
             records[credit_idx][status_col] = "recheck"
             records[debit_idx][status_col] = "recheck"
+
+def detect_and_mark_duplicates(
+    records: List[Dict[str, Any]],
+    debit_col: str = "Debit",
+    credit_col: str = "Credit",
+    descr_col: str = "Deskripsi",
+    double_col: str = "double?",       # nama header yang akan ditambahkan di kolom K
+) -> None:
+    """
+    Menandai semua baris yang memiliki nilai debit **atau** credit sama
+    **dan** deskripsi yang identik (setelah normalisasi) dengan kata
+    "double" pada kolom `double_col`.
+
+    Modifikasi `records` secara in‑place.
+    """
+    # Kamus untuk debit dan credit
+    debit_groups: Dict[Tuple[Any, str], List[int]] = {}
+    credit_groups: Dict[Tuple[Any, str], List[int]] = {}
+
+    for idx, rec in enumerate(records):
+        descr_norm = _norm_descr(rec.get(descr_col, ""))
+
+        # ----- Debit -----
+        debit_val = rec.get(debit_col)
+        if debit_val not in (None, 0):
+            key = (debit_val, descr_norm)
+            debit_groups.setdefault(key, []).append(idx)
+
+        # ----- Credit -----
+        credit_val = rec.get(credit_col)
+        if credit_val not in (None, 0):
+            key = (credit_val, descr_norm)
+            credit_groups.setdefault(key, []).append(idx)
+
+    # Kumpulkan semua indeks yang muncul lebih dari satu kali
+    double_idxs: set[int] = set()
+
+    for idx_list in debit_groups.values():
+        if len(idx_list) > 1:                # lebih dari satu baris dengan nilai & deskripsi sama
+            double_idxs.update(idx_list)
+            
+    for idx_list in credit_groups.values():
+        if len(idx_list) > 1:
+            double_idxs.update(idx_list)
+
+    # Tandai kolom double? pada semua indeks yang duplikat
+    for idx in double_idxs:
+        records[idx][double_col] = "double"
 
 def build_lookup(records: List[Dict[str, Any]], key: str) -> Dict[Any, List[int]]:
     """
@@ -176,6 +230,7 @@ def reconcile_with_separate_unmatched(
     credit_col: str = "Credit",
     descr_col: str = "Deskripsi",          # <‑‑ nama kolom deskripsi
     status_col: str = "Catatan",           # <‑‑ kolom J (akan di‑isi "recheck")
+    double_col: str = "double?",
     min_common_words: int = 1,            # default ambang 1 kata
     ratio: float | None = None,           # optional persentase (0‑1)
     dry_run: bool = False,
@@ -184,8 +239,9 @@ def reconcile_with_separate_unmatched(
     wb_src, ws_src = load_sheet(src_path, sheet_name)
     header, records = sheet_to_records(ws_src)
 
-    if status_col not in header:
-        header.append(status_col)
+    for col_name in (status_col, double_col):
+        if col_name not in header:
+            header.append(col_name)          # tambahkan di akhir header
 
     # ---------- 2. Pairing ----------
     debit_lookup  = build_lookup(records, debit_col)
@@ -238,6 +294,14 @@ def reconcile_with_separate_unmatched(
         status_col=status_col,
         min_common_words=min_common_words,
         ratio=ratio,
+    )
+
+    detect_and_mark_duplicates(
+        records,
+        debit_col=debit_col,
+        credit_col=credit_col,
+        descr_col=descr_col,
+        double_col=double_col,
     )
 
     # ---------- 3. Urutan akhir ----------
